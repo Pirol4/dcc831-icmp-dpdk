@@ -1,0 +1,13 @@
+# build artifacts
+icmp-echo
+build/
+*.o
+*.d
+
+# editor / OS
+*.swp
+.vscode/
+.DS_Store
+
+# never commit the DPDK tree
+dpdk/
