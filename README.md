@@ -34,20 +34,24 @@ checksum update would also work; we recompute for clarity.
 
 ## Build
 
-On the Cloudlab m510 node, after building DPDK as in the assignment:
+On the Cloudlab m510 node, after building DPDK 20.08 as in the assignment
+(`make config T=x86_64-native-linuxapp-gcc && make -j16`, output in
+`~/dpdk/build/`):
 
 ```bash
-# meson/pkg-config DPDK (recent releases)
-export PKG_CONFIG_PATH=$HOME/dpdk/build/meson-uninstalled
-make
-
-# --- OR, classic DPDK 20.08 make-based build ---
 export RTE_SDK=$HOME/dpdk
-export RTE_TARGET=x86_64-native-linuxapp-gcc
+export RTE_TARGET=build      # the assignment's build lands in ~/dpdk/build, not the T-named dir
 make
 ```
 
-Produces `./icmp-echo` (or `build/icmp-echo` with the legacy build).
+Produces `./build/icmp-echo`.
+
+If instead you have a meson/pkg-config DPDK install:
+
+```bash
+export PKG_CONFIG_PATH=$(dirname $(find $HOME/dpdk -name libdpdk.pc | head -1))
+make            # produces ./icmp-echo
+```
 
 ## Run — server machine
 
@@ -55,7 +59,7 @@ Produces `./icmp-echo` (or `build/icmp-echo` with the legacy build).
 # hugepages (already done during setup, repeat if the experiment restarted)
 echo 1024 | sudo tee /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
 
-sudo ./icmp-echo -l 0 -n 4 -- --port 1
+sudo ./build/icmp-echo -l 0 -n 4 -- --port 1
 ```
 
 `-l 0` pins the poll loop to core 0, `-n 4` sets memory channels, everything
