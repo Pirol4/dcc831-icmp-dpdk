@@ -1,0 +1,43 @@
+Adversarial probe (tests/probe.py) run from the client (node-1) against the
+DPDK echo server on node-0. icmp-echo running on the server throughout.
+
+$ sudo python3 probe.py --iface eno1d1 --server-mac 14:58:d0:58:fe:23
+
+iface eno1d1  client-mac 14:58:d0:58:2f:f3  ->  server-mac 14:58:d0:58:fe:23
+
+1. valid echo request  ->  expect a valid echo reply
+    [PASS] reply received
+    [PASS] ICMP type == 0 (echo reply)  (type=0)
+    [PASS] IPs swapped  (192.168.1.3 -> 192.168.1.2)
+    [PASS] id / seq preserved
+    [PASS] payload echoed byte-for-byte
+    [PASS] IP header checksum correct  (0xf748 vs 0xf748)
+    [PASS] ICMP checksum correct  (0xa76f vs 0xa76f)
+    [PASS] server forced TTL = 64  (ttl=64)
+
+2. echo request with a WRONG icmp checksum  ->  reply anyway, with a fixed checksum
+    [PASS] still got a reply (server does not validate input csum)
+    [PASS] reply ICMP checksum is correct (recomputed, not reflected)  (0x7876 vs 0x7876)
+
+3. echo request to a made-up dst IP 192.168.1.123  ->  reply from .123
+    [PASS] reply received
+    [PASS] reply src is the made-up IP  (192.168.1.123)
+
+negative tests (expect NO reply, server must not crash):
+    [PASS] 4. ICMP echo REPLY (type 0) as input  (no reply)
+    [PASS] 5. ICMP echo request with code = 5  (no reply)
+    [PASS] 6. ICMP timestamp request (type 13)  (no reply)
+    [PASS] 7. UDP packet to the server  (no reply)
+    [PASS] 8. truncated: IP.len says 200 but frame is tiny  (no reply)
+    [PASS] 9. non-IPv4 ethertype (0x88B5)  (no reply)
+
+10. after all the junk, a valid echo request  ->  server still answers
+    [PASS] server survived and replied
+
+==== 19 passed, 0 failed ====
+
+Server counters afterwards (Ctrl+C):
+  echo replies sent      : 4     (tests 1, 2, 3, 10 -- the 4 well-formed requests)
+  other packets dropped  : 11    (tests 4-9 = 6 crafted junk frames, + ~5 stray
+                                  L2 frames seen in promiscuous mode: IPv6 NDP,
+                                  switch LLDP/STP, etc.)

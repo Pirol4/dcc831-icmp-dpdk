@@ -1,0 +1,27 @@
+Server stats captured right after the adversarial probe (tests/probe.py).
+
+NOTE: this is a 4-packet, cold-cache sample taken only to confirm liveness and
+the drop counter. It is NOT a performance measurement -- with 4 widely spaced
+packets there is no cache warmth and no RX/TX pipelining, so the per-packet
+numbers here are 3-5x the steady-state figures. The real measurement is
+results/run1-server-stats.txt (353k packets under ping -f): 303 ns avg.
+
+$ sudo ./build/icmp-echo -l 0 -n 4 -- --port 1
+...
+===== ICMP echo server statistics =====
+echo replies sent      : 4
+other packets dropped  : 11
+TSC frequency          : 2000000000 Hz
+--- window: rx_burst return -> tx_burst return ---
+cycles / reply  (avg)  : 3003.2
+cycles / reply  (min)  : 672
+cycles / reply  (max)  : 9092
+nanoseconds/reply(avg) : 1501.6
+nanoseconds/reply(min) : 336.0
+nanoseconds/reply(max) : 4546.0
+--- of which: parse + craft only (app logic) ---
+cycles / reply  (avg)  : 667.0
+nanoseconds/reply(avg) : 333.5
+--- remainder attributed to DPDK rx/tx path ---
+nanoseconds/reply(avg) : 1168.1
+=======================================

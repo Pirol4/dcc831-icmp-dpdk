@@ -42,6 +42,29 @@ back in from sleep for each of the first few packets; the **flood average of
 10 µs (min 7 µs)** is the representative steady-state round trip and is used
 below.
 
+### Correctness validation (`tests/probe.py`, `results/run2-probe.txt`)
+
+A scapy probe from the client crafts raw frames and checks the replies —
+**19/19 checks pass**:
+
+* the reply is a real re-craft, not a byte reflection: ICMP type flipped
+  8→0, **both checksums recomputed and valid** (verified independently), TTL
+  forced to 64, id/seq and the full payload preserved, src/dst IP swapped;
+* it still answers a request carrying a deliberately **wrong** ICMP checksum,
+  and the reply's checksum is correct — proof it recomputes rather than
+  copies;
+* reflection is stateless — a request to a fabricated dst IP is answered from
+  that IP;
+* every non-echo-request frame is **silently dropped without crashing**: an
+  ICMP echo *reply*, echo request with code≠0, timestamp request, UDP,
+  a truncated IP packet, a non-IPv4 ethertype. The server's
+  `other packets dropped` counter accounts for them.
+
+It is definitely the DPDK app answering, not the kernel: with `icmp-echo`
+stopped, `ping 192.168.1.3` gets 100 % loss (no IP bound, no ARP handling on
+the server); deleting the client's static ARP entry also kills it, because
+the server never answers ARP.
+
 ---
 
 ## Q2 — Time in our software + DPDK vs. the rest of the path. How to measure/infer the raw hardware latency?
