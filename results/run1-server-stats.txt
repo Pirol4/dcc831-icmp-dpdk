@@ -1,0 +1,42 @@
+=== sudo ./build/icmp-echo -l 0 -n 4 -- --port 1  (server = node-0) ===
+EAL: Detected 16 lcore(s)
+EAL: Detected 1 NUMA nodes
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: Selected IOVA mode 'PA'
+EAL: No available hugepages reported in hugepages-1048576kB
+EAL: Probing VFIO support...
+EAL: Probe PCI driver: net_mlx4 (15b3:1007) device: 0000:09:00.0 (socket 0)
+EAL: No legacy callbacks, legacy socket not created
+DPDK sees 2 ethernet port(s); using port 1.
+Port 1 MAC: 14:58:d0:58:fe:23
+
+Core 0 answering ICMP echo on port 1. [Ctrl+C to quit]
+^C
+
+Signal 2 received, shutting down...
+
+===== ICMP echo server statistics =====
+echo replies sent      : 353179
+other packets dropped  : 12
+TSC frequency          : 2000000000 Hz
+--- window: rx_burst return -> tx_burst return ---
+cycles / reply  (avg)  : 606.4
+cycles / reply  (min)  : 505
+cycles / reply  (max)  : 488313
+nanoseconds/reply(avg) : 303.2
+nanoseconds/reply(min) : 252.5
+nanoseconds/reply(max) : 244156.5
+--- of which: parse + craft only (app logic) ---
+cycles / reply  (avg)  : 153.3
+nanoseconds/reply(avg) : 76.6
+--- remainder attributed to DPDK rx/tx path ---
+nanoseconds/reply(avg) : 226.6
+=======================================
+
+Notes:
+- 353179 replies = 353174 (flood) + 5 (ping -c 5). Client saw every reply, 0% loss.
+- "other packets dropped": 12 non-echo frames (ARP / IPv6 multicast / switch chatter).
+- TSC = 2.0 GHz (m510 Xeon D-1548 nominal), rte_get_timer_hz() reported exactly 2e9.
+- max = 488313 cycles (244 us) is a single scheduling/IRQ outlier; core 0 is not
+  isolated from the kernel scheduler (no isolcpus). min/avg are the representative
+  figures.

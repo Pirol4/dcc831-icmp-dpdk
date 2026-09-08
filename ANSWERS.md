@@ -1,167 +1,186 @@
 # DCC831 TP — Hand-in Answers
 
-> Fill in the bracketed numbers after running the experiment on Cloudlab.
-> The reasoning/method is written out; only the measured values are missing.
+Experiment: two Cloudlab **m510** nodes (8-core Xeon D-1548 @ 2.0 GHz,
+ConnectX-3 10 GbE), directly connected on the private port `eno1d1`, forced
+onto the same physical switch (interswitch mapping disabled). DPDK 20.08,
+mlx4 PMD (bifurcated driver).
+
+* **server** (node-0): runs `icmp-echo` on DPDK **port 1** (`eno1d1`,
+  MAC `14:58:d0:58:fe:23`). Port 0 (`eno1`) stays with Linux for ssh.
+* **client** (node-1): plain Linux, `eno1d1` = `192.168.1.2/24`, static ARP
+  `192.168.1.3 -> 14:58:d0:58:fe:23`, generates traffic with `ping`.
+
+Raw logs: `results/run1-client-ping.txt`, `results/run1-server-stats.txt`.
+
+---
 
 ## Q1 — `ping` output from the client
 
-Paste the output of `ping -c 20 192.168.1.3` and `sudo ping -f 192.168.1.3`
-(run for ~10 s, then Ctrl+C). Expected: 0% packet loss, RTT on the order of
-tens of microseconds over the direct 10 GbE link.
-
 ```
-<paste ping output here>
+# ping -c 5 192.168.1.3   (cold)
+rtt min/avg/max/mdev = 0.040/0.051/0.078/0.014 ms
+
+# sudo ping -f 192.168.1.3   (~15.7 s)
+353174 packets transmitted, 353174 received, 0% packet loss, time 15737ms
+rtt min/avg/max/mdev = 0.007/0.010/0.424/0.005 ms, ipg/ewma 0.044/0.010 ms
 ```
 
-Also paste the server's statistics block (printed on Ctrl+C).
+The DPDK echo server answered **353179 / 353179** ICMP echo requests
+(353174 flood + 5 from the cold run) with **0 % packet loss**. Server-side
+statistics (TSC based, 2.0 GHz):
+
+| metric (per echo reply)                    | value          |
+|--------------------------------------------|---------------:|
+| rx_burst→tx_burst window, avg              | 606 cyc / **303 ns** |
+| rx_burst→tx_burst window, min              | 505 cyc / 253 ns |
+| rx_burst→tx_burst window, max (outlier)    | 488313 cyc / 244 µs |
+| ├─ parse + craft (app logic), avg          | 153 cyc / **77 ns** |
+| └─ DPDK rx/tx descriptor+doorbell, avg     | 453 cyc / **227 ns** |
+
+The cold `ping -c 5` averages 51 µs because the `ping` process is scheduled
+back in from sleep for each of the first few packets; the **flood average of
+10 µs (min 7 µs)** is the representative steady-state round trip and is used
+below.
 
 ---
 
 ## Q2 — Time in our software + DPDK vs. the rest of the path. How to measure/infer the raw hardware latency?
 
-### Decomposition of one echo round trip
+### Where the 10 µs round trip goes
 
 ```
-client kernel: build request, hand to NIC        ] t_client_tx
-  wire + switch  client -> server                 ] t_wire/2
-  server NIC RX (DMA into mbuf) + mlx4 PMD        ] t_nic_rx
-  >>> our timed window starts (rx_burst returns)
-  parse ETH/IP/ICMP, swap fields, 2 checksums     ] t_sw
-  DPDK tx_burst -> descriptor write -> NIC        ] t_tx_path
-  >>> our timed window ends (tx_burst returns)
-  server NIC actually serializes the frame        ] t_nic_tx
-  wire + switch  server -> client                 ] t_wire/2
-  client NIC RX + kernel matches reply, stops RTT ] t_client_rx
+                                        time    share of RTT
+client: sendto() -> kernel v4/ICMP -> mlx4 xmit -> doorbell   ─┐
+wire + switch  client -> server            ~0.1 µs            │  ~9.5 µs
+server NIC RX: PCIe DMA into mbuf + mlx4 PMD ring handling    │   (~95 %)
+>>> our TSC window opens (rx_burst returned)                 ─┘
+parse ETH/IP/ICMP, swap MACs+IPs, 2 checksums     0.077 µs    0.8 %
+DPDK tx_burst: build WQE, mbuf refcount, TX doorbell 0.227 µs  2.3 %
+>>> our TSC window closes (tx_burst returned)
+server NIC serialises the frame, wire+switch back  ~0.1 µs    ~1 %
+client NIC RX -> IRQ/NAPI -> skb -> socket match, ping reads  ─ (in the 9.5 µs)
 ```
 
-`ping` RTT (client) ≈
-`t_client_tx + t_client_rx + t_wire + t_nic_rx + t_nic_tx + t_sw + t_tx_path`.
+* **Our software + DPDK RX/TX path (measured, server side):**
+  **303 ns avg** (253 ns min). That is **~3 %** of the 10 µs round trip
+  (≈ 3.6 % of the 7 µs best case).
+* **Everything else** = `RTT − 303 ns` ≈ **9.7 µs (flood avg)** / **6.7 µs
+  (flood min)**. This is dominated by the **client's Linux networking stack**
+  (send path + receive path, no kernel-bypass on the client), plus both NICs'
+  RX/TX engines + PCIe DMA, plus a negligible amount of wire.
+* **Wire is not the bottleneck:** a 98-byte ICMP frame (+20 B preamble/IFG)
+  at 10 Gbit/s serialises in **~94 ns** one way, ~0.19 µs for the round trip.
 
-### What we measure directly
+So on this link the ICMP round trip is **almost entirely CPU/stack time on
+the client**, and our DPDK server is a ~3 % slice of it.
 
-* **`t_sw + t_tx_path`** — the "our software + DPDK" number — is measured on the
-  server with `rte_rdtsc_precise()` around the loop body
-  (`rx_burst` return → `tx_burst` return), converted with
-  `microseconds = cycles * 1e6 / rte_get_timer_hz()`.
-  Measured: **avg [___] ns, min [___] ns, max [___] ns** per reply.
+### How to measure or infer the *raw networking hardware* latency
 
-* **Full RTT** — from the client's `ping` output: **avg [___] µs**.
+The client RTT still bundles the client kernel, the two NICs and the wire.
+To isolate the hardware part:
 
-* **Rest of the path** (wire + both NICs' RX/TX + both kernel stacks on the
-  client) = `RTT − (t_sw + t_tx_path)` = **[___] µs**.
-  This is the great majority of the RTT; our processing is a small slice.
+1. **DPDK-only loopback (no kernel anywhere).** Have the DPDK app transmit a
+   probe frame on port 1 and receive it back (loop the link through the
+   switch, or a physical loopback), timestamping with `rte_rdtsc_precise()`
+   just before `tx_burst` and just after the frame reappears on `rx_burst`.
+   The result is `2·(NIC_tx + wire + NIC_rx)` with **zero OS stack**; half of
+   it is the one-way hardware latency. (Requires a loop path — see
+   "additional experiment" note in the README.)
 
-### Isolating / inferring the raw networking hardware latency
+2. **Instrument the mlx4 PMD (assignment hint).** In
+   `drivers/net/mlx4/mlx4_rxtx.c`, read the TSC inside `mlx4_rx_burst()` at
+   the point the PMD reads the completion-queue entry, and stash it in an
+   mbuf dynfield. Comparing it with the TSC at `rx_burst` return isolates the
+   PMD/RX-ring cost from the DMA the CPU can't observe; the same around the
+   TX WQE-post / CQE path isolates `tx_burst`'s hardware-facing cost.
 
-The RTT still lumps together the client's Linux stack, the two NICs, and the
-wire. Ways to separate the hardware part:
+3. **ConnectX-3 hardware RX timestamps.** Enable
+   `RTE_ETH_RX_OFFLOAD_TIMESTAMP`; the NIC stamps each frame with its own
+   clock at wire arrival. `mbuf_timestamp` vs. TSC at `rx_burst` return
+   measures RX DMA + ring latency directly, in NIC-clock units.
 
-1. **Loopback subtraction.** Connect the server's port 1 to itself (or to the
-   switch and back) and have the DPDK app both send and receive. Timestamp a
-   packet with the TSC just before `tx_burst` and just after it comes back on
-   `rx_burst`; that value is `2·(t_nic_tx + t_wire/2 + t_nic_rx)` with **no
-   Linux stack and no second machine** involved. Half of it is the one-way
-   hardware latency.
+4. **Same-switch vs. inter-switch delta.** Re-run `ping -f` with "allow
+   interswitch mapping" enabled (extra switch hop) and subtract from the
+   same-switch RTT — the difference is one switch's store-and-forward plus
+   one extra cable, i.e. the per-hop wire+switch latency in isolation.
 
-2. **Instrument the mlx4 PMD (assignment hint).** Add a `rte_rdtsc()` read
-   inside `mlx4_rx_burst()` in `drivers/net/mlx4/mlx4_rxtx.c`, right where the
-   PMD reads the completion queue entry, and stamp it into the mbuf (e.g.
-   `mbuf->udata64` or a dynfield). Comparing that to the TSC value at
-   `rx_burst` return in the app gives the PMD/RX-ring contribution
-   (`t_nic_rx` minus the DMA time the CPU can't see). Doing the same around the
-   TX completion path gives `t_tx_path`.
-
-3. **NIC hardware timestamps.** ConnectX-3 can PTP-timestamp frames on RX
-   (`RTE_ETH_RX_OFFLOAD_TIMESTAMP` / `rte_mbuf_dynfield` timestamp).
-   `mbuf timestamp` (NIC clock, set at wire arrival) vs. TSC at `rx_burst`
-   return measures RX DMA + ring latency in NIC-clock units.
-
-4. **Switch/cable delta.** Measure RTT with the "allow interswitch mapping"
-   box unchecked (same switch, ~one hop) vs. checked (extra switch hop); the
-   difference is roughly one switch's store-and-forward + one extra cable,
-   isolating per-hop wire+switch latency. Also compare against the theoretical
-   serialization time: a 98-byte ICMP frame at 10 Gbps ≈ 78 ns on the wire.
-
-### Answer to write up
-
-> Our software + DPDK RX/TX path costs **[___] ns** per echo, which is
-> **[___]%** of the **[___] µs** ping RTT. The remaining **[___] µs** is spent
-> in the client's Linux networking stack (dominant), the two NICs' RX/TX
-> engines, and ~[___] ns of wire/switch serialization. We infer the raw
-> hardware latency with a DPDK-only loopback measurement (method 1), which
-> yields a one-way NIC+wire latency of **[___] ns**.
+5. **Kernel-server baseline (cheap, isolates the server's own stack cost).**
+   Stop the DPDK app, give the server `192.168.1.3/24` on `eno1d1`, `ping -f`
+   again: the RTT increase over the DPDK run is `(kernel echo path) −
+   (DPDK echo path)` on the server, which bounds how much of the 9.7 µs
+   "rest" is a Linux stack traversal.
 
 ---
 
 ## Q3 — Overhead introduced by the DPDK software stack
 
-Within the timed window, the cost splits into:
+Measured on the server, per echo reply (TSC @ 2.0 GHz):
 
-* **Application logic** (`make_echo_reply`): header validation, two
-  `rte_ether_addr` copies + one address swap, one IPv4 address swap, one
-  `rte_ipv4_cksum` over 20 bytes, one `rte_raw_cksum` over the ICMP message
-  (typically 64 bytes for default `ping`). All L1-cache resident, branch-light:
-  order of **tens of ns**.
+| component                          | cycles | ns   | share |
+|------------------------------------|-------:|-----:|------:|
+| parse + craft (`make_echo_reply`)  | 153    | 77   | 25 %  |
+| `rx_burst` + `tx_burst` (DPDK)     | 453    | 227  | 75 %  |
+| **total (rx_burst→tx_burst)**      | 606    | 303  | 100 % |
 
-* **DPDK RX/TX path**: `rte_eth_rx_burst`/`rte_eth_tx_burst` are thin inlined
-  wrappers, but each call touches the mlx4 completion & work queues in host
-  memory, writes a doorbell (MMIO), and manages mbuf refcounts. This
-  descriptor/doorbell handling is the bulk of the DPDK-attributable overhead.
+* **App logic (77 ns).** Header validation, one `rte_ether_addr` swap, one
+  IPv4 address swap, `rte_ipv4_cksum` over 20 B, `rte_raw_cksum` over the
+  ~64-byte ICMP message. The two checksum passes are the bulk of it.
+* **DPDK RX/TX path (227 ns).** `rte_eth_rx_burst` / `rte_eth_tx_burst` are
+  thin inlined wrappers, but each touches the mlx4 completion & work queues
+  in host memory, manages mbuf refcounts, and — the expensive part — issues
+  an **MMIO doorbell write** to the NIC on TX (~100+ ns by itself). This is
+  the irreducible cost of talking to the hardware from user space.
+* **Measurement caveat.** The per-packet nested `rte_rdtsc_precise()` used to
+  split app vs. DPDK adds ~2 serialising reads (~20–40 cyc) that land in the
+  "DPDK path" bucket, so the true split is a few ns more toward the app side.
 
-Estimate the split by also timing *just* `make_echo_reply` with a nested
-`rte_rdtsc_precise()` pair:
-
-| component                     | cycles | ns   |
-|-------------------------------|-------:|-----:|
-| parse + craft (app)           | [___]  | [___]|
-| rx_burst + tx_burst (DPDK)    | [___]  | [___]|
-| **total window**              | [___]  | [___]|
-
-Compare with a kernel-based baseline: run the server as a normal Linux host
-(`ping` answered by the kernel) and read RTT — the DPDK version should show a
-markedly lower and far more stable (low max−min) server contribution because
-there is no interrupt, no softirq, no syscall, no sk_buff allocation, and no
-context switch. Report the RTT distribution (avg + jitter) for both.
-
-> The DPDK stack adds **[___] ns** per packet, almost entirely descriptor-ring
-> and doorbell handling; the kernel path adds **[___] µs** and much higher
-> jitter for the same work.
+**Versus the kernel.** The DPDK server contributes 303 ns with ~50 ns of
+jitter (min 253, avg 303), excluding rare scheduler outliers. A kernel ICMP
+reply for the same packet costs an interrupt + softirq + `sk_buff`
+alloc/free + protocol demux — typically **single-digit microseconds** and far
+more jittery. DPDK does not *add* overhead here; it *removes* the kernel's,
+trading it for a ~230 ns poll-mode descriptor/doorbell path. (Run experiment
+5 in Q2 to quantify the kernel baseline on this exact hardware.)
 
 ---
 
 ## Q4 — Is the implementation optimal? What could be improved?
 
-Not fully optimal. Reasonable, but the following would reduce latency and/or
-raise throughput:
+It is efficient but **not optimal**. Ranked by expected benefit:
 
-1. **Checksum offload.** Let the NIC compute the IPv4 header checksum
-   (`RTE_ETH_TX_OFFLOAD_IPV4_CKSUM` + `mbuf->ol_flags`), removing a pass over
-   the header on the CPU. ICMP checksum has no HW offload on ConnectX-3, but
-   an **incremental update** (only the type byte changed 8→0) replaces the
-   full `rte_raw_cksum` with a single 16-bit add + fold.
+1. **Incremental ICMP checksum.** Only the type byte changes (8 → 0), so the
+   full `rte_raw_cksum` over 64 B can be replaced by a single 16-bit
+   add-with-carry on the checksum field (`csum += ~htons(0x0800); fold`).
+   Removes most of the app-logic cost.
 
-2. **Avoid the burst-window averaging.** We currently charge one
-   `rx→tx` window to a whole burst; per-packet TSC stamping (at a small
-   measurement cost) gives a true per-packet distribution.
+2. **NIC checksum offload for IPv4.** Set
+   `RTE_ETH_TX_OFFLOAD_IPV4_CKSUM` + `mbuf->ol_flags |= PKT_TX_IP_CKSUM`
+   and let the ConnectX-3 fill the IPv4 header checksum, dropping the
+   `rte_ipv4_cksum` pass from the CPU. (ICMP has no HW offload on this NIC —
+   hence point 1.)
 
-3. **Batching / prefetch.** Prefetch the next mbuf's header
-   (`rte_prefetch0`) while processing the current one; split the loop into
-   classify then transform then a single `tx_burst` (already done) to keep the
-   TX doorbell amortized over the burst.
+3. **TX doorbell amortisation.** Under the flood the RX burst already carries
+   many packets, so one `tx_burst` per burst already amortises the doorbell;
+   adding `rte_eth_tx_buffer` with an explicit flush threshold would help at
+   lower/bursty rates. Prefetch the next mbuf's header (`rte_prefetch0`)
+   while crafting the current reply.
 
-4. **Larger RX burst + TX buffering** (`rte_eth_tx_buffer`) under flood load to
-   amortize doorbell writes further; tune `nb_rxd`/`nb_txd`.
+4. **Drop the per-packet nested timing** in production runs (keep it only for
+   a calibration pass) — it costs 2 serialised TSC reads per packet.
 
-5. **Multi-queue / RSS + multiple lcores** if a single core saturates — for
-   ICMP echo one m510 core is nowhere near the 10 GbE packet rate, so this is
-   throughput headroom, not latency.
+5. **Core isolation.** Boot the server with `isolcpus`/`nohz_full` on core 0
+   (or run under `taskset` + `chrt`) to remove the 244 µs scheduler outliers
+   seen in `max`.
 
-6. **Drop promiscuous mode** once the MACs are fixed; not required here.
+6. **NUMA.** Already correct here (single socket); the app warns if the port
+   is on a remote node.
 
-7. **NUMA correctness**: pin the lcore and the mbuf pool to the NIC's socket
-   (the app already warns if the port is on a remote node).
+7. **Multi-queue / RSS + more lcores** — pure throughput headroom. One m510
+   core sustained the flood (22 kpps here, and would handle far more) so
+   this is not needed for ICMP echo, but it is the path to line rate.
 
-> Our per-packet server cost is small relative to the RTT, so the biggest
-> real-world win is on the *client* side (also bypass the kernel with DPDK) or
-> in the hardware/wire, not in this code. Within this code, checksum offload +
-> incremental ICMP checksum is the highest-value change.
+**Bigger picture.** Our server is already only ~3 % of the round trip. The
+dominant cost is the **client's Linux stack**; the highest-impact change for
+end-to-end latency would be to bypass the kernel on the *client* too (a DPDK
+packet generator), or to reduce hardware/wire latency — neither is a change
+to this code. Within this code, points 1 + 2 are the clear wins.
