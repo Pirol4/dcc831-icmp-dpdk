@@ -97,6 +97,19 @@ client NIC RX -> IRQ/NAPI -> skb -> socket match, ping reads  ─ (in the 9.5 µ
 So on this link the ICMP round trip is **almost entirely CPU/stack time on
 the client**, and our DPDK server is a ~3 % slice of it.
 
+### Cross-check with the kernel baseline (experiment 5 below)
+
+Replacing the DPDK server with the Linux kernel raises the RTT from
+10 → 17 µs (avg), i.e. **+7 µs** for a full server-side stack traversal.
+That gives a consistent budget for the 10 µs DPDK round trip:
+
+| segment | ~time | how obtained |
+|---|---:|---|
+| server DPDK software + RX/TX path | 0.3 µs | measured (TSC) |
+| client Linux stack, both directions + `ping` syscalls | ~7 µs | kernel-baseline delta, by symmetry |
+| 2× NIC RX/TX engines + PCIe DMA | ~2 µs | remainder |
+| wire + switch (2×) | ~0.2 µs | 10 GbE serialisation of a 98 B frame |
+
 ### How to measure or infer the *raw networking hardware* latency
 
 The client RTT still bundles the client kernel, the two NICs and the wire.
@@ -127,11 +140,22 @@ To isolate the hardware part:
    same-switch RTT — the difference is one switch's store-and-forward plus
    one extra cable, i.e. the per-hop wire+switch latency in isolation.
 
-5. **Kernel-server baseline (cheap, isolates the server's own stack cost).**
-   Stop the DPDK app, give the server `192.168.1.3/24` on `eno1d1`, `ping -f`
-   again: the RTT increase over the DPDK run is `(kernel echo path) −
-   (DPDK echo path)` on the server, which bounds how much of the 9.7 µs
-   "rest" is a Linux stack traversal.
+5. **Kernel-server baseline (done — `results/run3-kernel-baseline.txt`).**
+   Stopped the DPDK app, gave the server `192.168.1.3/24` on `eno1d1`, ran
+   `ping -f` again so the server's **Linux kernel** answers:
+
+   | server         | flood RTT min / avg | server-side work |
+   |----------------|---------------------|------------------|
+   | DPDK app       | 7 µs / 10 µs        | 303 ns (measured) |
+   | Linux kernel   | 11 µs / 17 µs       | ~4–7 µs (RTT delta) |
+
+   The RTT rises by **+4 µs (min) / +7 µs (avg)** when the kernel does the
+   work the DPDK app was doing. So a full server-side stack traversal
+   (IRQ/NAPI → `ip_rcv` → `icmp_echo` → `icmp_reply` → `ip_output` →
+   `dev_queue_xmit`) costs **~4–7 µs**; DPDK does the same in **0.3 µs**,
+   ~15–20× less. By symmetry the *client's* kernel contributes a similar
+   ~7 µs to the DPDK-run RTT — which is why "the rest of the path" in Q2 is
+   dominated by the client stack.
 
 ---
 
@@ -157,13 +181,16 @@ Measured on the server, per echo reply (TSC @ 2.0 GHz):
   split app vs. DPDK adds ~2 serialising reads (~20–40 cyc) that land in the
   "DPDK path" bucket, so the true split is a few ns more toward the app side.
 
-**Versus the kernel.** The DPDK server contributes 303 ns with ~50 ns of
-jitter (min 253, avg 303), excluding rare scheduler outliers. A kernel ICMP
-reply for the same packet costs an interrupt + softirq + `sk_buff`
-alloc/free + protocol demux — typically **single-digit microseconds** and far
-more jittery. DPDK does not *add* overhead here; it *removes* the kernel's,
-trading it for a ~230 ns poll-mode descriptor/doorbell path. (Run experiment
-5 in Q2 to quantify the kernel baseline on this exact hardware.)
+**Versus the kernel (measured — `results/run3-kernel-baseline.txt`).**
+Running the same echo through the Linux kernel instead of the DPDK app raises
+the flood RTT from **10 → 17 µs** (avg) and **7 → 11 µs** (min). The
+server-side work therefore goes from **0.3 µs (DPDK)** to **~4–7 µs
+(kernel)** — a **15–20× reduction**. The kernel path pays for a hardware
+interrupt, NAPI softirq, `sk_buff` alloc/free, protocol demux
+(`ip_rcv`/`icmp_rcv`), and re-entry into `ip_output`/`dev_queue_xmit`; the
+DPDK path pays only for a poll of the mlx4 completion queue and a TX doorbell.
+So DPDK does not *add* overhead here — it *removes* the kernel's, trading
+~5 µs of stack for ~230 ns of descriptor/doorbell handling.
 
 ---
 
