@@ -1,14 +1,12 @@
-/* SPDX-License-Identifier: BSD-3-Clause
- *
- * DCC831 - Advanced Operating Systems - TP
- * DPDK ICMP Ping Echo Server
- *
- * Receives raw Ethernet frames on port 1 (the m510 private NIC port),
- * parses IPv4 + ICMP headers, turns every ICMP echo request into an echo
- * reply *in place*, fixes the checksums, and transmits it back.
- *
- * Based on DPDK's examples/skeleton (basicfwd.c).
- */
+/* 
+ TP1 - Advanced Operating Systems
+ DPDK ICMP Ping Echo Server
+ 
+ Aluno: Filipe Pirola Santos
+ Professor: Marcos Augusto Menezes Vieira
+ 
+ Sistemas Operacionais Avançados
+*/
 
 #include <stdint.h>
 #include <inttypes.h>
@@ -32,13 +30,14 @@
 #define MBUF_CACHE_SIZE 250
 #define BURST_SIZE 32
 
-/* The m510 NIC exposes 2 DPDK ports. Port 0 = public (Linux/ssh), port 1 =
- * private link between the two experiment machines. We only touch port 1. */
+// Only use port 1 to keep ssh conection
 static uint16_t g_port_id = 1;
 
-/* ---- DPDK version compatibility ------------------------------------------ *
- * The Ethernet header field names were renamed in DPDK 21.11
- * (s_addr/d_addr -> src_addr/dst_addr). The assignment targets DPDK 20.08. */
+/* 
+ DPDK version compatibility
+ The Ethernet header field names were renamed in DPDK 21.11
+ (s_addr/d_addr -> src_addr/dst_addr). The assignment targets DPDK 20.08. 
+*/
 #if RTE_VERSION >= RTE_VERSION_NUM(21, 11, 0, 0)
 #define ETH_SRC(h) ((h)->src_addr)
 #define ETH_DST(h) ((h)->dst_addr)
@@ -51,12 +50,11 @@ static uint16_t g_port_id = 1;
 #define RXMODE_MTU_FIELD mtu
 #endif
 
-/* ---- performance measurement ------------------------------------------- */
 struct proc_stats {
-	uint64_t replies;        /* echo replies produced                    */
-	uint64_t other_pkts;     /* non echo-request packets seen and dropped */
-	uint64_t proc_cycles;    /* TSC cycles: rx_burst return -> tx_burst   */
-	uint64_t app_cycles;     /* TSC cycles: parse+craft only (no rx/tx)   */
+	uint64_t replies;       
+	uint64_t other_pkts;     
+	uint64_t proc_cycles;   
+	uint64_t app_cycles;    
 	uint64_t min_cycles;
 	uint64_t max_cycles;
 };
@@ -64,18 +62,14 @@ static struct proc_stats g_stats = { .min_cycles = UINT64_MAX };
 
 static volatile bool g_force_quit;
 
-static void
-handle_signal(int sig)
-{
+static void handle_signal(int sig) {
 	if (sig == SIGINT || sig == SIGTERM) {
 		printf("\n\nSignal %d received, shutting down...\n", sig);
 		g_force_quit = true;
 	}
 }
 
-static void
-dump_stats(void)
-{
+static void dump_stats(void) {
 	uint64_t hz = rte_get_timer_hz();
 	uint64_t n = g_stats.replies;
 
@@ -107,12 +101,8 @@ dump_stats(void)
 	printf("=======================================\n");
 }
 
-/*
- * Initialize port `port` with 1 RX and 1 TX queue.
- */
-static inline int
-port_init(uint16_t port, struct rte_mempool *mbuf_pool)
-{
+// Initialize port `port` with 1 RX and 1 TX queue.
+static inline int port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
 	struct rte_eth_conf port_conf;
 	const uint16_t rx_rings = 1, tx_rings = 1;
 	uint16_t nb_rxd = RX_RING_SIZE;
@@ -188,25 +178,21 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 }
 
 /*
- * Recompute the ICMP checksum over `len` bytes starting at `icmp`.
- * The icmp_cksum field must already be zeroed by the caller.
- */
-static inline uint16_t
-icmp_checksum(const void *icmp, uint16_t len)
-{
+ Recompute the ICMP checksum over `len` bytes starting at `icmp`.
+ The icmp_cksum field must already be zeroed by the caller.
+*/
+static inline uint16_t icmp_checksum(const void *icmp, uint16_t len) {
 	uint16_t sum = rte_raw_cksum(icmp, len);   /* folded, not inverted */
 	uint16_t cksum = (uint16_t)~sum;
 	return cksum ? cksum : (uint16_t)0xffff;
 }
 
 /*
- * Try to turn one received mbuf into an ICMP echo reply, in place.
- * Returns true if `m` now holds a reply ready to transmit,
- * false if the packet is not an ICMP echo request (caller should free it).
- */
-static inline bool
-make_echo_reply(struct rte_mbuf *m)
-{
+ Try to turn one received mbuf into an ICMP echo reply, in place.
+ Returns true if `m` now holds a reply ready to transmit,
+ false if the packet is not an ICMP echo request (caller should free it).
+*/
+static inline bool make_echo_reply(struct rte_mbuf *m) {
 	struct rte_ether_hdr *eth;
 	struct rte_ipv4_hdr *ip;
 	struct rte_icmp_hdr *icmp;
@@ -239,13 +225,13 @@ make_echo_reply(struct rte_mbuf *m)
 
 	icmp_len = (uint16_t)(ip_total - ip_hlen);
 
-	/* --- Ethernet: swap src/dst MAC (reply goes back to the sender) --- */
+	// Ethernet: swap src/dst MAC (reply goes back to the sender)
 	struct rte_ether_addr tmp_mac;
 	rte_ether_addr_copy(&ETH_SRC(eth), &tmp_mac);
 	rte_ether_addr_copy(&ETH_DST(eth), &ETH_SRC(eth));
 	rte_ether_addr_copy(&tmp_mac, &ETH_DST(eth));
 
-	/* --- IPv4: swap src/dst addr, reset TTL, recompute header checksum - */
+	// IPv4: swap src/dst addr, reset TTL, recompute header checksum
 	uint32_t tmp_ip = ip->src_addr;
 	ip->src_addr = ip->dst_addr;
 	ip->dst_addr = tmp_ip;
@@ -253,7 +239,7 @@ make_echo_reply(struct rte_mbuf *m)
 	ip->hdr_checksum = 0;
 	ip->hdr_checksum = rte_ipv4_cksum(ip);
 
-	/* --- ICMP: echo request (8) -> echo reply (0), recompute checksum -- */
+	// ICMP: echo request (8) -> echo reply (0), recompute checksum
 	icmp->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
 	icmp->icmp_cksum = 0;
 	icmp->icmp_cksum = icmp_checksum(icmp, icmp_len);
@@ -271,9 +257,7 @@ make_echo_reply(struct rte_mbuf *m)
  * server side. Everything else in the ping RTT (wire, switch, the Linux
  * client's kernel stack) is outside this window -- see ANSWERS.md.
  */
-static void
-lcore_main(void)
-{
+static void lcore_main(void) {
 	const uint16_t port = g_port_id;
 	struct rte_mbuf *bufs[BURST_SIZE];
 	struct rte_mbuf *out[BURST_SIZE];
@@ -315,7 +299,7 @@ lcore_main(void)
 		uint64_t elapsed = rte_rdtsc_precise() - t0;
 
 		if (nb_tx > 0) {
-			/* charge the whole burst window to the replies in it */
+			// charge the whole burst window to the replies in it
 			uint64_t per = elapsed / nb_tx;
 			g_stats.proc_cycles += elapsed;
 			g_stats.replies += nb_tx;
@@ -325,15 +309,13 @@ lcore_main(void)
 				g_stats.max_cycles = per;
 		}
 
-		/* free replies the NIC could not accept */
+		// free replies the NIC could not accept
 		for (uint16_t i = nb_tx; i < nb_out; i++)
 			rte_pktmbuf_free(out[i]);
 	}
 }
 
-int
-main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
 	struct rte_mempool *mbuf_pool;
 
 	int ret = rte_eal_init(argc, argv);
@@ -342,7 +324,6 @@ main(int argc, char *argv[])
 	argc -= ret;
 	argv += ret;
 
-	/* optional: "--port N" after the EAL "--" separator */
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
 			g_port_id = (uint16_t)atoi(argv[++i]);
